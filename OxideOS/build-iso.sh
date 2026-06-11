@@ -2,7 +2,7 @@
 # build-iso.sh — Build OxideOS Live ISO
 #
 # Prerequisites (Debian/Ubuntu host with root):
-#   apt install debootstrap squashfs-tools xorriso isolinux syslinux-common grub-pc-bin grub-efi-amd64-bin mtools systemd-container
+#   apt install debootstrap squashfs-tools xorriso dosfstools isolinux syslinux-common grub-pc-bin grub-efi-amd64-bin mtools systemd-container
 #
 # Usage:
 #   sudo ./build-iso.sh
@@ -296,7 +296,7 @@ grub-mkimage \
 
 # 3. FAT image for UEFI El Torito partition
 dd if=/dev/zero of="${ISO_DIR}/boot/efiboot.img" bs=1M count=4 status=none
-mformat -i "${ISO_DIR}/boot/efiboot.img" -F ::
+mkfs.fat -F 12 -n "EFI" "${ISO_DIR}/boot/efiboot.img"
 mmd -i "${ISO_DIR}/boot/efiboot.img" ::/EFI
 mmd -i "${ISO_DIR}/boot/efiboot.img" ::/EFI/BOOT
 mcopy -i "${ISO_DIR}/boot/efiboot.img" "${ISO_DIR}/EFI/BOOT/BOOTX64.EFI" ::/EFI/BOOT/
@@ -306,6 +306,7 @@ info "Assembling bootable hybrid ISO with xorriso..."
 
 xorriso -as mkisofs \
     -iso-level 3 \
+    -r -J -joliet-long \
     -full-iso9660-filenames \
     -volid "OXIDEOS" \
     -eltorito-boot isolinux/isolinux.bin \
@@ -315,6 +316,7 @@ xorriso -as mkisofs \
     -eltorito-alt-boot \
     -e boot/efiboot.img \
     -no-emul-boot -isohybrid-gpt-basdat \
+    -append_partition 2 0xef "${ISO_DIR}/boot/efiboot.img" \
     -output "${ISO_NAME}" \
     "${ISO_DIR}" \
     || err "xorriso failed"

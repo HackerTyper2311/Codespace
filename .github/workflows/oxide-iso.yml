@@ -33,6 +33,7 @@ jobs:
             debootstrap \
             squashfs-tools \
             xorriso \
+            dosfstools \
             isolinux \
             syslinux-common \
             grub-pc-bin \
