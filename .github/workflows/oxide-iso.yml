@@ -33,6 +33,8 @@ jobs:
             debootstrap \
             squashfs-tools \
             xorriso \
+            isolinux \
+            syslinux-common \
             grub-pc-bin \
             grub-efi-amd64-bin \
             mtools \

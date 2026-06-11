@@ -2,7 +2,7 @@
 # build-iso.sh — Build OxideOS Live ISO
 #
 # Prerequisites (Debian/Ubuntu host with root):
-#   apt install debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin mtools systemd-container
+#   apt install debootstrap squashfs-tools xorriso isolinux syslinux-common grub-pc-bin grub-efi-amd64-bin mtools systemd-container
 #
 # Usage:
 #   sudo ./build-iso.sh
@@ -223,22 +223,45 @@ mkdir -p "${ISO_DIR}/live"
 cp -v "${CHROOT_DIR}/boot/vmlinuz-"*     "${ISO_DIR}/live/vmlinuz"
 cp -v "${CHROOT_DIR}/boot/initrd.img-"*   "${ISO_DIR}/live/initrd.img"
 
-# ── Stage 8: GRUB bootloader ───────────────────────────────────
-info "Setting up GRUB bootloader..."
+# ── Stage 8: Bootloader (ISOLINUX BIOS + GRUB UEFI) ────────────
+info "Setting up ISOLINUX (BIOS) and GRUB (UEFI)..."
 
+# 1. ISOLINUX for legacy BIOS boot
+mkdir -p "${ISO_DIR}/isolinux"
+cp /usr/lib/ISOLINUX/isolinux.bin "${ISO_DIR}/isolinux/"
+
+# MBR for hybrid ISO (try multiple locations)
+cp /usr/lib/ISOLINUX/isohdpfx.bin "${BUILD_DIR}/isohdpfx.bin" 2>/dev/null \
+  || cp /usr/lib/syslinux/mbr/isohdpfx.bin "${BUILD_DIR}/isohdpfx.bin"
+
+# COM32 modules needed by ISOLINUX 6.x (try multiple locations)
+for mod in ldlinux.c32 libcom32.c32 libutil.c32; do
+  cp "/usr/lib/ISOLINUX/$mod" "${ISO_DIR}/isolinux/" 2>/dev/null \
+    || cp "/usr/lib/syslinux/modules/bios/$mod" "${ISO_DIR}/isolinux/" 2>/dev/null \
+    || true
+done
+
+cat > "${ISO_DIR}/isolinux/isolinux.cfg" <<'ISOCFG'
+DEFAULT live
+TIMEOUT 50
+PROMPT 1
+
+LABEL live
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img boot=live components quiet splash
+
+LABEL safemode
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img boot=live components nomodeset noapic
+ISOCFG
+
+# 2. GRUB for UEFI boot
 mkdir -p "${ISO_DIR}/boot/grub"
+mkdir -p "${ISO_DIR}/EFI/BOOT"
 
 cat > "${ISO_DIR}/boot/grub/grub.cfg" <<'GRUBCFG'
 set timeout=5
 set default=0
-set gfxmode=auto
-set gfxpayload=keep
-
-insmod all_video
-insmod gfxterm
-insmod png
-insmod part_gpt
-insmod ext2
 
 menuentry "OxideOS Live (Default)" {
     linux /live/vmlinuz boot=live components quiet splash
@@ -254,20 +277,47 @@ menuentry "OxideOS Live (No Sync)" {
     linux /live/vmlinuz boot=live components quiet oxide.nosync
     initrd /live/initrd.img
 }
-
 GRUBCFG
 
-# ── Stage 9: Build ISO with grub-mkrescue ─────────────────────
-info "Assembling bootable ISO with grub-mkrescue..."
+# Embedded config for standalone GRUB EFI to find grub.cfg on ISO
+cat > "${BUILD_DIR}/grub-embed.cfg" <<'EOF'
+search --set=root --file /boot/grub/grub.cfg
+set prefix=($root)/boot/grub
+configfile /boot/grub/grub.cfg
+EOF
 
-command -v grub-mkrescue >/dev/null 2>&1 || err "Missing grub-mkrescue (apt install grub-pc-bin grub-efi-amd64-bin xorriso mtools)"
+# Build BOOTX64.EFI executable
+grub-mkimage \
+    -O x86_64-efi \
+    -c "${BUILD_DIR}/grub-embed.cfg" \
+    -o "${ISO_DIR}/EFI/BOOT/BOOTX64.EFI" \
+    -p /boot/grub \
+    part_gpt part_msdos fat ext2 iso9660 search normal linux boot
 
-grub-mkrescue \
-    -o "${ISO_NAME}" \
-    --modules="part_gpt part_msdos ext2 all_video boot normal" \
-    --compress=xz \
+# 3. FAT image for UEFI El Torito partition
+dd if=/dev/zero of="${ISO_DIR}/boot/efiboot.img" bs=1M count=4 status=none
+mformat -i "${ISO_DIR}/boot/efiboot.img" -F ::
+mmd -i "${ISO_DIR}/boot/efiboot.img" ::/EFI
+mmd -i "${ISO_DIR}/boot/efiboot.img" ::/EFI/BOOT
+mcopy -i "${ISO_DIR}/boot/efiboot.img" "${ISO_DIR}/EFI/BOOT/BOOTX64.EFI" ::/EFI/BOOT/
+
+# ── Stage 9: Build ISO with xorriso ───────────────────────────
+info "Assembling bootable hybrid ISO with xorriso..."
+
+xorriso -as mkisofs \
+    -iso-level 3 \
+    -full-iso9660-filenames \
+    -volid "OXIDEOS" \
+    -eltorito-boot isolinux/isolinux.bin \
+    -eltorito-catalog isolinux/boot.cat \
+    -no-emul-boot -boot-load-size 4 -boot-info-table \
+    -isohybrid-mbr "${BUILD_DIR}/isohdpfx.bin" \
+    -eltorito-alt-boot \
+    -e boot/efiboot.img \
+    -no-emul-boot -isohybrid-gpt-basdat \
+    -output "${ISO_NAME}" \
     "${ISO_DIR}" \
-    || err "grub-mkrescue failed"
+    || err "xorriso failed"
 
 # ── Done ────────────────────────────────────────────────────────
 echo
