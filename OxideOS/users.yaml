@@ -1,0 +1,19 @@
+# OxideOS - User Configuration
+# Single source of truth for system users
+# Source: raw_url or google_drive_file_id
+
+users:
+  - username: alice
+    admin: true
+    password_hash: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRJsVMzWvBhGNh4rOoUyD7s"
+    shell: /bin/bash
+
+  - username: bob
+    admin: false
+    password_hash: "$argon2id$v=19$m=65536,t=3,p=4$YW5vdGhlcnNhbHQ$1L2bRfBhL7F+GmZoH3KNfIVDQ/7bB52pG8Y2rNjuJIc"
+    shell: /bin/bash
+
+  - username: carol
+    admin: false
+    password_hash: "$argon2id$v=19$m=65536,t=3,p=4$dGhpcmRzYWx0$rQfH5LJg9n2TvYm4NCXj8/FQzBkPcJDp3Mh5KtR6WxA"
+    shell: /bin/sh

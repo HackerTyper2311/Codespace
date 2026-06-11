@@ -1,0 +1,69 @@
+#!/bin/bash
+# oxide-boot-sync — OxideOS Live Boot User Synchronization
+# Runs at boot, fetches users.yaml from Google Drive, applies declared state.
+#
+# Configure DRIVE_ID below or via kernel cmdline: oxide.drive_id=FILE_ID
+# Alternatively: oxide.raw_url=https://...
+
+set -euo pipefail
+
+DRIVE_ID="${OXIDE_DRIVE_ID:-1JywIYjQ94UIu9_-fQV0fEphtm_XGFRsk}"
+OXYDE_SYNCD="/usr/local/bin/oxide-syncd"
+LOG_TAG="oxide-boot-sync"
+RETRY_DELAY=5
+MAX_RETRIES=12
+
+log() { echo "[$(date +%H:%M:%S)] $*" | systemd-cat -t "$LOG_TAG" -p info; }
+warn() { echo "[$(date +%H:%M:%S)] WARN $*" | systemd-cat -t "$LOG_TAG" -p warning; }
+
+# ── Parse kernel command line for oxide.* overrides ──────────────
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        oxide.drive_id=*)  DRIVE_ID="${arg#*=}" ;;
+        oxide.raw_url=*)   RAW_URL="${arg#*=}" ;;
+        oxide.nosync)      log "nosync flag set – skipping sync"; exit 0 ;;
+    esac
+done
+
+if [ ! -x "$OXYDE_SYNCD" ]; then
+    log "oxide-syncd not found at $OXYDE_SYNCD — nothing to sync"
+    exit 1
+fi
+
+log "OxideOS boot sync starting"
+log "Drive ID: ${DRIVE_ID:-none}  Raw URL: ${RAW_URL:-none}"
+
+# ── Wait for network ────────────────────────────────────────────
+for i in $(seq 1 "$MAX_RETRIES"); do
+    if ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
+        log "Network up after $((i * RETRY_DELAY))s"
+        break
+    fi
+    if [ "$i" -eq "$MAX_RETRIES" ]; then
+        warn "No network after $((MAX_RETRIES * RETRY_DELAY))s — skipping sync"
+        exit 0  # Live ISO shouldn't fail boot without network
+    fi
+    sleep "$RETRY_DELAY"
+done
+
+# ── Run oxide-syncd ─────────────────────────────────────────────
+ARGS=()
+if [ -n "${RAW_URL:-}" ]; then
+    ARGS+=(--raw-url "$RAW_URL")
+elif [ -n "${DRIVE_ID:-}" ]; then
+    ARGS+=(--drive-id "$DRIVE_ID")
+else
+    warn "No config source configured"
+    exit 1
+fi
+
+ARGS+=(--apply)
+
+log "Running: $OXYDE_SYNCD ${ARGS[*]}"
+if "$OXYDE_SYNCD" "${ARGS[@]}" 2>&1 | systemd-cat -t "$LOG_TAG"; then
+    log "Sync completed successfully"
+else
+    warn "Sync exited with code $? — login may be affected"
+fi
+
+log "Boot sync finished"

@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""
+oxide-syncd — OxideOS Declarative User Synchronization Daemon
+
+Fetches users.yaml (local, raw URL, or Google Drive file ID),
+parses it, compares against the live Linux system, and optionally
+applies the declared state via useradd/usermod/userdel.
+"""
+
+import argparse
+import grp
+import logging
+import os
+import pwd
+import re
+import spwd
+import subprocess
+import sys
+import tempfile
+
+import requests
+import yaml
+
+LOG = logging.getLogger("oxide-syncd")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+GOOGLE_DRIVE_BASE = "https://drive.google.com/uc?export=download"
+SUDO_GROUP = "sudo"
+DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
+
+# ---------------------------------------------------------------------------
+# Config fetching
+# ---------------------------------------------------------------------------
+
+
+def detect_source(source: str) -> str:
+    """Return 'file', 'raw_url', or 'google_drive_file_id' for *source*."""
+    if os.path.isfile(source):
+        return "file"
+    if source.startswith("http://") or source.startswith("https://"):
+        # Could be a raw URL or a Google Drive sharing URL.
+        if "drive.google.com" in source:
+            return "google_drive_file_id"
+        return "raw_url"
+    if DRIVE_ID_RE.match(source):
+        return "google_drive_file_id"
+    return "unknown"
+
+
+def build_drive_url(drive_id: str) -> str:
+    """Convert a Google Drive file ID or sharing URL into a direct download URL."""
+    # Already a Google Drive sharing URL
+    if "drive.google.com" in drive_id:
+        # Try to extract the file ID from common URL patterns
+        m = re.search(r"/d/([A-Za-z0-9_-]+)", drive_id)
+        if m:
+            drive_id = m.group(1)
+        else:
+            m = re.search(r"id=([A-Za-z0-9_-]+)", drive_id)
+            if m:
+                drive_id = m.group(1)
+    return f"{GOOGLE_DRIVE_BASE}&id={drive_id}"
+
+
+def fetch_yaml(source: str, source_type: str) -> str:
+    """Return the raw YAML text for the given source and type."""
+    if source_type == "file":
+        with open(source, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    if source_type == "google_drive_file_id":
+        url = build_drive_url(source)
+    else:  # raw_url
+        url = source
+
+    LOG.info("Fetching config from %s", url)
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    return resp.text
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_users(yaml_text: str) -> list[dict]:
+    """Parse YAML and return the list of user definitions."""
+    data = yaml.safe_load(yaml_text)
+    if not isinstance(data, dict) or "users" not in data:
+        raise ValueError("YAML must contain a top-level 'users' key")
+    users = data["users"]
+    if not isinstance(users, list):
+        raise ValueError("'users' must be a list")
+    # Validate required fields
+    for i, entry in enumerate(users):
+        if not isinstance(entry, dict):
+            raise ValueError(f"users[{i}] must be a mapping, got {type(entry).__name__}")
+        if "username" not in entry:
+            raise ValueError(f"users[{i}] is missing required key 'username'")
+    return users
+
+
+# ---------------------------------------------------------------------------
+# System state inspection
+# ---------------------------------------------------------------------------
+
+
+def get_system_users() -> dict[str, dict]:
+    """Return a dict username → {uid, gid, shell, admin, groups} for
+    every *service* user (uid >= 1000)."""
+    system: dict[str, dict] = {}
+    try:
+        sudo_members = grp.getgrnam(SUDO_GROUP).gr_mem
+    except KeyError:
+        sudo_members = []  # sudo group doesn't exist
+
+    for entry in pwd.getpwall():
+        if entry.pw_uid < 1000 or entry.pw_uid == 65534:
+            continue  # skip system users and nobody
+        admin = entry.pw_name in sudo_members or entry.pw_uid == 0
+        # Fetch password hash from /etc/shadow for diff comparison
+        pw_hash = ""
+        try:
+            pw_hash = spwd.getspnam(entry.pw_name).sp_pwdp
+        except (KeyError, PermissionError):
+            pass
+        system[entry.pw_name] = {
+            "uid": entry.pw_uid,
+            "gid": entry.pw_gid,
+            "shell": entry.pw_shell,
+            "admin": admin,
+            "password_hash": pw_hash,
+        }
+    return system
+
+
+# ---------------------------------------------------------------------------
+# Diff engine
+# ---------------------------------------------------------------------------
+
+
+def compute_diff(
+    declared: list[dict], current: dict[str, dict]
+) -> tuple[list[dict], list[dict], list[str]]:
+    """Compare declared users against the live system.
+
+    Returns (to_add, to_modify, to_remove).
+    """
+    declared_names = {u["username"] for u in declared}
+    current_names = set(current.keys())
+
+    to_add: list[dict] = []
+    to_modify: list[dict] = []
+    to_remove: list[str] = []
+
+    for user in declared:
+        name = user["username"]
+        if name not in current:
+            to_add.append(user)
+        else:
+            changed = False
+            cur = current[name]
+            # Check admin status
+            if user.get("admin", False) != cur["admin"]:
+                changed = True
+            # Check shell
+            declared_shell = user.get("shell", "/bin/bash")
+            if declared_shell and declared_shell != cur["shell"]:
+                changed = True
+            # Check password hash
+            declared_hash = user.get("password_hash", "")
+            cur_hash = cur.get("password_hash", "")
+            if declared_hash and declared_hash != cur_hash:
+                changed = True
+            if changed:
+                to_modify.append(user)
+
+    # Users on the system but not in the declaration → remove
+    to_remove = sorted(current_names - declared_names)
+
+    return to_add, to_modify, to_remove
+
+
+# ---------------------------------------------------------------------------
+# Apply (idempotent)
+# ---------------------------------------------------------------------------
+
+
+def apply_add(user: dict, dry_run: bool = True) -> None:
+    """Create a new system user and set their password hash."""
+    name = user["username"]
+    admin = user.get("admin", False)
+    shell = user.get("shell", "/bin/bash")
+    pw_hash = user.get("password_hash", "")
+
+    cmd = [
+        "sudo",
+        "useradd",
+        "-m",
+        "-s",
+        shell,
+        name,
+    ]
+    if admin:
+        cmd.extend(["-G", SUDO_GROUP])
+
+    if dry_run:
+        LOG.info("[DRY-RUN] Would add user: %s  admin=%s  shell=%s  cmd=%s",
+                 name, admin, shell, " ".join(cmd))
+    else:
+        LOG.info("Adding user: %s", name)
+        subprocess.run(cmd, check=True)
+        # Set password hash in /etc/shadow
+        if pw_hash:
+            subprocess.run(
+                ["sudo", "usermod", "-p", pw_hash, name],
+                check=True,
+            )
+            LOG.info("  ✓ password hash set")
+        LOG.info("  ✓ user created")
+
+
+def apply_modify(user: dict, dry_run: bool = True) -> None:
+    """Modify an existing user (admin group membership, shell)."""
+    name = user["username"]
+    admin = user.get("admin", False)
+    shell = user.get("shell", "/bin/bash")
+
+    actions = []
+    if dry_run:
+        prefix = "[DRY-RUN] Would"
+    else:
+        prefix = "Applying"
+
+    # Admin / sudo group
+    try:
+        in_sudo = name in grp.getgrnam(SUDO_GROUP).gr_mem
+    except KeyError:
+        in_sudo = False
+
+    add_sudo = admin and not in_sudo
+    remove_sudo = not admin and in_sudo
+    cur_shell = pwd.getpwnam(name).pw_shell
+    change_shell = bool(shell and shell != cur_shell)
+    # Check current password hash via spwd
+    cur_pw_hash = ""
+    try:
+        cur_pw_hash = spwd.getspnam(name).sp_pwdp
+    except (KeyError, PermissionError):
+        pass
+    pw_hash = user.get("password_hash", "")
+    change_pw = bool(pw_hash and pw_hash != cur_pw_hash)
+
+    if dry_run:
+        if add_sudo:
+            actions.append(f"add {name} to {SUDO_GROUP}")
+        if remove_sudo:
+            actions.append(f"remove {name} from {SUDO_GROUP}")
+        if change_shell:
+            actions.append(f"set shell to {shell}")
+        if change_pw:
+            actions.append(f"set password hash")
+    else:
+        # Build a single atomic usermod call when possible
+        cmd = ["sudo", "usermod"]
+        if add_sudo:
+            cmd.extend(["-aG", SUDO_GROUP])
+        if change_shell:
+            cmd.extend(["-s", shell])
+        if change_pw:
+            cmd.extend(["-p", pw_hash])
+        cmd.append(name)
+        if add_sudo or change_shell or change_pw:
+            subprocess.run(cmd, check=True)
+            if add_sudo:
+                actions.append(f"added {name} to {SUDO_GROUP}")
+            if change_shell:
+                actions.append(f"set shell to {shell}")
+            if change_pw:
+                actions.append(f"set password hash")
+        if remove_sudo:
+            subprocess.run(["sudo", "gpasswd", "-d", name, SUDO_GROUP], check=True)
+            actions.append(f"removed {name} from {SUDO_GROUP}")
+
+    if actions:
+        LOG.info("%s modify user %s: %s", prefix, name, "; ".join(actions))
+
+
+def apply_remove(username: str, dry_run: bool = True) -> None:
+    """Remove a system user (preserves home directory by default)."""
+    if dry_run:
+        LOG.info("[DRY-RUN] Would remove user: %s", username)
+    else:
+        LOG.info("Removing user: %s", username)
+        subprocess.run(["sudo", "userdel", username], check=True)
+        LOG.info("  ✓ user removed")
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+
+def print_report(
+    to_add: list[dict], to_modify: list[dict], to_remove: list[str]
+) -> None:
+    """Human-readable diff summary."""
+    print()
+    print("=" * 56)
+    print("  OxideOS System State Report")
+    print("=" * 56)
+
+    if not to_add and not to_modify and not to_remove:
+        print("  ✓ System is in sync — no changes needed.")
+    else:
+        if to_add:
+            print(f"\n  ➕ Users to CREATE ({len(to_add)}):")
+            for u in to_add:
+                admin = "admin" if u.get("admin") else "user"
+                print(f"     • {u['username']:20s} ({admin})")
+        if to_modify:
+            print(f"\n  🔄 Users to MODIFY ({len(to_modify)}):")
+            for u in to_modify:
+                admin = "admin" if u.get("admin") else "user"
+                print(f"     • {u['username']:20s} → {admin}")
+        if to_remove:
+            print(f"\n  ➖ Users to REMOVE ({len(to_remove)}):")
+            for name in to_remove:
+                print(f"     • {name}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="OxideOS declarative user sync daemon"
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to local users.yaml",
+    )
+    parser.add_argument(
+        "--raw-url",
+        help="HTTPS URL pointing to users.yaml",
+    )
+    parser.add_argument(
+        "--drive-id",
+        help="Google Drive file ID (or sharing URL)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually apply changes (default: dry-run only)",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Verbose output",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    # Determine source
+    source = args.config or args.raw_url or args.drive_id
+    if not source:
+        parser.error("One of --config, --raw-url, or --drive-id is required")
+    if sum(1 for x in [args.config, args.raw_url, args.drive_id] if x) > 1:
+        parser.error("Only one of --config, --raw-url, or --drive-id may be used")
+
+    source_type = detect_source(source)
+    if source_type == "unknown":
+        LOG.error("Could not determine source type for '%s'", source)
+        sys.exit(1)
+
+    LOG.info("Source type: %s", source_type)
+
+    # Fetch & parse
+    yaml_text = fetch_yaml(source, source_type)
+    declared = parse_users(yaml_text)
+    LOG.info("Parsed %d user(s) from declaration", len(declared))
+
+    # Inspect system
+    current = get_system_users()
+    LOG.info("Found %d non-system user(s) on host", len(current))
+
+    # Diff
+    to_add, to_modify, to_remove = compute_diff(declared, current)
+
+    # Report
+    print_report(to_add, to_modify, to_remove)
+
+    # Apply
+    if args.apply:
+        LOG.warning("APPLY mode — changes will be written to the system!")
+        for user in to_add:
+            apply_add(user, dry_run=False)
+        for user in to_modify:
+            apply_modify(user, dry_run=False)
+        for name in to_remove:
+            apply_remove(name, dry_run=False)
+        LOG.info("Sync complete.")
+    else:
+        LOG.info("Dry-run complete. Use --apply to commit changes.")
+
+
+if __name__ == "__main__":
+    main()

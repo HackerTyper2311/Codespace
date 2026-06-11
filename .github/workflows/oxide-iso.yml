@@ -1,0 +1,58 @@
+name: OxideOS ISO Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'OxideOS/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'OxideOS/**'
+  workflow_dispatch:
+    inputs:
+      drive_id:
+        description: 'Google Drive file ID for users.yaml'
+        required: false
+        default: '1JywIYjQ94UIu9_-fQV0fEphtm_XGFRsk'
+
+jobs:
+  build-iso:
+    name: Build OxideOS Live ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ISO build dependencies
+        run: |
+          sudo apt update -qq
+          sudo apt install -y -qq \
+            debootstrap \
+            squashfs-tools \
+            xorriso \
+            grub-pc-bin \
+            grub-efi-amd64-bin \
+            mtools \
+            systemd-container
+
+      - name: Build OxideOS Live ISO
+        env:
+          OXIDE_DRIVE_ID: ${{ github.event.inputs.drive_id || '' }}
+        run: |
+          cd OxideOS
+          sudo OXIDE_DRIVE_ID="${OXIDE_DRIVE_ID:-1JywIYjQ94UIu9_-fQV0fEphtm_XGFRsk}}" ./build-iso.sh
+
+      - name: Show ISO info
+        run: |
+          ls -lh OxideOS/oxideos-live-*.iso
+          file OxideOS/oxideos-live-*.iso
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxideos-live-iso
+          path: OxideOS/oxideos-live-*.iso
+          retention-days: 7

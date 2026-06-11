@@ -1,0 +1,17 @@
+[Unit]
+Description=OxideOS Declarative User Sync (Boot)
+Documentation=https://github.com/vltx/oxideos
+After=network-online.target
+Wants=network-online.target
+Before=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oxide-boot-sync
+RemainAfterExit=no
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
