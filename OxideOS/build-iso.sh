@@ -34,12 +34,10 @@ readonly PACKAGES=(
     systemd-resolved
     # Python runtime for oxide-syncd
     python3 python3-requests python3-yaml
-    python3-argon2-cffi
+    python3-pip
     # Boot
     linux-image-amd64
     live-boot
-    # Console
-    getty
     # Optional: SSH for remote login
     openssh-server
 )
@@ -153,6 +151,9 @@ systemctl enable ssh.service
 
 # Disable services not needed in live ISO
 systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+# Install argon2-cffi via pip (not packaged for Debian)
+pip3 install --break-system-packages argon2-cffi
 
 # Set root password (locked by default in live ISO)
 passwd -d root
