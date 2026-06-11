@@ -182,6 +182,8 @@ AUTOLOGIN
 # ── Stage 6: Build squashfs ────────────────────────────────────
 info "Building compressed rootfs (squashfs)..."
 
+mkdir -p "${ISO_DIR}/live"
+
 # Exclude transient/system mounts from the chroot before squashing
 rm -rf "${CHROOT_DIR}/run/"*     2>/dev/null || true
 rm -rf "${CHROOT_DIR}/tmp/"*     2>/dev/null || true
