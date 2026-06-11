@@ -30,7 +30,7 @@ readonly PACKAGES=(
     bash coreutils util-linux passwd adduser sudo
     apt ca-certificates curl wget
     # Network
-    iproute2 iputils-ping netbase ifupdown
+    iproute2 iputils-ping
     systemd-resolved
     # Python runtime for oxide-syncd
     python3 python3-requests python3-yaml
@@ -139,32 +139,50 @@ FSTAB
 info "Enabling systemd services..."
 
 systemd-nspawn -D "${CHROOT_DIR}" --pipe /bin/bash <<'ENDCHROOT'
-# Enable oxide-syncd boot service
-systemctl enable oxide-syncd.service
+# Ensure target directories exist
+mkdir -p /etc/systemd/system/multi-user.target.wants
+mkdir -p /etc/systemd/system/sockets.target.wants
 
-# Enable network
-systemctl enable systemd-networkd.service
-systemctl enable systemd-resolved.service
+# Enable oxide-syncd boot service (direct symlink — safer than systemctl in chroot)
+ln -sf /etc/systemd/system/oxide-syncd.service \
+  /etc/systemd/system/multi-user.target.wants/oxide-syncd.service
 
-# Enable SSH (optional)
-systemctl enable ssh.service
+# Enable networkd and resolved (direct symlinks)
+ln -sf /lib/systemd/system/systemd-networkd.service \
+  /etc/systemd/system/multi-user.target.wants/systemd-networkd.service
+ln -sf /lib/systemd/system/systemd-resolved.service \
+  /etc/systemd/system/multi-user.target.wants/systemd-resolved.service
 
-# Disable services not needed in live ISO
-systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+# Enable SSH
+ln -sf /lib/systemd/system/ssh.service \
+  /etc/systemd/system/multi-user.target.wants/ssh.service
 
-# Install argon2-cffi via pip (not packaged for Debian)
-pip3 install --break-system-packages argon2-cffi
-
-# Set root password (locked by default in live ISO)
+# Set root password (unlocked in live ISO)
 passwd -d root
 
 # Rebuild initramfs so live-boot hooks are included
 update-initramfs -u -k all
 
-# Clean up
+# Clean up apt
 apt clean
 rm -rf /var/lib/apt/lists/*
 ENDCHROOT
+
+# ── Network config for systemd-networkd ───────────────────────
+info "Configuring network (DHCP)..."
+
+mkdir -p "${CHROOT_DIR}/etc/systemd/network"
+cat > "${CHROOT_DIR}/etc/systemd/network/20-wired.network" <<'NETWORK'
+[Match]
+Name=en*
+Name=eth*
+
+[Network]
+DHCP=yes
+NETWORK
+
+# systemd-resolved needs this symlink
+ln -sf /run/systemd/resolve/stub-resolv.conf "${CHROOT_DIR}/etc/resolv.conf"
 
 # ── Stage 5: Live user (auto-login on tty1) ────────────────────
 # Create a live user that auto-logs in — oxide-boot-sync will create
