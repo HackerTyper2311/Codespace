@@ -248,11 +248,11 @@ PROMPT 1
 
 LABEL live
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd.img boot=live components quiet splash
+  APPEND initrd=/live/initrd.img boot=live components findiso=/live/filesystem.squashfs
 
 LABEL safemode
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd.img boot=live components nomodeset noapic
+  APPEND initrd=/live/initrd.img boot=live components nomodeset noapic findiso=/live/filesystem.squashfs
 ISOCFG
 
 # 2. GRUB for UEFI boot
@@ -264,17 +264,17 @@ set timeout=5
 set default=0
 
 menuentry "OxideOS Live (Default)" {
-    linux /live/vmlinuz boot=live components quiet splash
+    linux /live/vmlinuz boot=live components findiso=/live/filesystem.squashfs
     initrd /live/initrd.img
 }
 
 menuentry "OxideOS Live (Safe Mode)" {
-    linux /live/vmlinuz boot=live components nomodeset noapic
+    linux /live/vmlinuz boot=live components nomodeset noapic findiso=/live/filesystem.squashfs
     initrd /live/initrd.img
 }
 
 menuentry "OxideOS Live (No Sync)" {
-    linux /live/vmlinuz boot=live components quiet oxide.nosync
+    linux /live/vmlinuz boot=live components oxide.nosync findiso=/live/filesystem.squashfs
     initrd /live/initrd.img
 }
 GRUBCFG
