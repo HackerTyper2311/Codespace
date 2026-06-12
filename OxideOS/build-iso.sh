@@ -157,10 +157,15 @@ ln -sf /lib/systemd/system/systemd-resolved.service \
 ln -sf /lib/systemd/system/ssh.service \
   /etc/systemd/system/multi-user.target.wants/ssh.service
 
+# Ensure required kernel modules are in the initramfs
+for mod in iso9660 squashfs overlay; do
+  echo "$mod" >> /etc/initramfs-tools/modules
+done
+
 # Set root password (unlocked in live ISO)
 passwd -d root
 
-# Rebuild initramfs so live-boot hooks are included
+# Rebuild initramfs so live-boot hooks AND required modules are included
 update-initramfs -u -k all
 
 # Clean up apt
